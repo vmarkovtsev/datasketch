@@ -1,10 +1,13 @@
 from collections import defaultdict
-import redis
 import os
 import random
 import string
 from abc import ABCMeta, abstractmethod
 ABC = ABCMeta('ABC', (object,), {}) # compatible with Python 2 *and* 3
+try:
+    import redis
+except ImportError:
+    redis = None
 
 
 def ordered_storage(config, name=None):
@@ -39,6 +42,8 @@ def ordered_storage(config, name=None):
     tp = config['type']
     if tp == 'dict':
         return DictListStorage(config)
+    if tp == 'compact':
+        return DictCompactStorage(config)
     if tp == 'redis':
         return RedisListStorage(config, name=name)
 
@@ -74,6 +79,8 @@ def unordered_storage(config, name=None):
     tp = config['type']
     if tp == 'dict':
         return DictSetStorage(config)
+    if tp == 'compact':
+        return DictCompactSetStorage(config)
     if tp == 'redis':
         return RedisSetStorage(config, name=name)
 
@@ -196,6 +203,75 @@ class DictListStorage(OrderedStorage):
         return key in self._dict
 
 
+class DictCompactStorage(OrderedStorage):
+    '''This is a memory efficient but slower variant of DictListStorage
+    '''
+    def __init__(self, config):
+        self._dict = {}
+
+    def keys(self):
+        return self._dict.keys()
+
+    def get(self, key):
+        element = self._dict.get(key)
+        if element is None:
+            return tuple()
+        if not isinstance(element, (tuple, list)):
+            return element,
+        return element
+
+    def remove(self, *keys):
+        for key in keys:
+            del self._dict[key]
+
+    def remove_val(self, key, val):
+        self._dict[key].remove(val)
+
+    def insert(self, key, *vals, **kwargs):
+        self._dict[key].extend(vals)
+
+    def size(self):
+        return len(self._dict)
+
+    def itemcounts(self, **kwargs):
+        '''Returns a dict where the keys are the keys of the container.
+        The values are the *lengths* of the value sequences stored
+        in this container.
+        '''
+        return {k: (len(v) if isinstance(v, (tuple, list)) else 1)
+                for k, v in self._dict.items()}
+
+    def has_key(self, key):
+        return key in self._dict
+
+    def insert(self, key, *vals, **kwargs):
+        THRESHOLD = 8
+        element = self._dict.get(key)
+        if element is None:
+            if len(vals) == 1:
+                self._dict[key] = vals[0]
+            elif len(vals) <= THRESHOLD:
+                self._dict[key] = vals
+            else:
+                self._dict[key] = list(vals)
+        else:
+            if isinstance(element, tuple):
+                if len(element) + len(vals) <= THRESHOLD:
+                    self._dict[key] = element + vals
+                else:
+                    self._dict[key] = v = []
+                    v.extend(element)
+                    v.extend(vals)
+            elif isinstance(element, list):
+                element.extend(vals)
+            else:
+                if 1 + len(vals) <= THRESHOLD:
+                    self._dict[key] = vals + (element,)
+                else:
+                    self._dict[key] = v = [element]
+                    v.extend(vals)
+
+
 class DictSetStorage(UnorderedStorage, DictListStorage):
     '''This is a wrapper class around ``defaultdict(set)`` enabling
     it to support an API consistent with `Storage`
@@ -210,203 +286,218 @@ class DictSetStorage(UnorderedStorage, DictListStorage):
         self._dict[key].update(vals)
 
 
-class RedisBuffer(redis.client.Pipeline):
-    '''A bufferized version of `redis.pipeline.Pipeline`.
 
-    The only difference from the conventional pipeline object is the
-    ``buffer_size``. Once the buffer is longer than the buffer size,
-    the pipeline is automatically executed, and the buffer cleared.
+class DictCompactSetStorage(UnorderedStorage, DictCompactStorage):
+    '''DictCompactStorage with unique elements.
     '''
-
-    def __init__(self, connection_pool, response_callbacks, transaction,
-                 shard_hint=None, buffer_size=50000):
-        self.buffer_size = buffer_size
-        super(RedisBuffer, self).__init__(
-            connection_pool, response_callbacks, transaction,
-            shard_hint=shard_hint)
-
-    def execute_command(self, *args, **kwargs):
-        if len(self.command_stack) >= self.buffer_size:
-            self.execute()
-        super(RedisBuffer, self).execute_command(*args, **kwargs)
-
-
-class RedisStorage:
-    '''Base class for Redis-based storage containers.
-
-    Args:
-        config (dict): Redis storage units require a configuration
-            of the form::
-
-                storage_config={
-                    'type': 'redis',
-                    'redis': {'host': 'localhost', 'port': 6379}
-                }
-
-            one can refer to system environment variables via::
-
-                storage_config={
-                    'type': 'redis',
-                    'redis': {
-                        'host': {'env': 'REDIS_HOSTNAME',
-                                 'default':'localhost'},
-                        'port': 6379}
-                    }
-                }
-
-        name (bytes, optional): A prefix to namespace all keys in
-            the database pertaining to this storage container.
-            If None, a random name will be chosen.
-    '''
-
-    def __init__(self, config, name=None):
-        self.config = config
-        redis_param = self._parse_config(self.config['redis'])
-        self._redis = redis.Redis(**redis_param)
-        self._buffer = RedisBuffer(self._redis.connection_pool,
-                                   self._redis.response_callbacks,
-                                   transaction=True)
-        if name is None:
-            name = _random_name(11)
-        self._name = name
-
-    def redis_key(self, key):
-        return self._name + key
-
-    def _parse_config(self, config):
-        cfg = {}
-        for key, value in config.items():
-            # If the value is a plain str, we will use the value
-            # If the value is a dict, we will extract the name of an environment
-            # variable stored under 'env' and optionally a default, stored under
-            # 'default'.
-            # (This is useful if the database relocates to a different host
-            # during the lifetime of the LSH object)
-            if isinstance(value, dict):
-                if 'env' in value:
-                    value = os.getenv(value['env'], value.get('default', None))
-            cfg[key] = value
-        return cfg
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        # We cannot pickle the connection objects, they get recreated
-        # upon unpickling
-        state.pop('_redis')
-        state.pop('_buffer')
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__ = state
-        # Reconnect here
-        self.__init__(self.config, name=self._name)
-
-
-class RedisListStorage(OrderedStorage, RedisStorage):
-
-    def __init__(self, config, name=None):
-        RedisStorage.__init__(self, config, name=name)
-
-    def keys(self):
-        return self._redis.hkeys(self._name)
-
-    def redis_keys(self):
-        return self._redis.hvals(self._name)
-
-    def status(self):
-        status = self._parse_config(self.config['redis'])
-        status.update(Storage.status(self))
-        return status
-
-    def get(self, key):
-        return self._get_items(self._redis, self.redis_key(key))
-
-    def getmany(self, *keys):
-        pipe = self._redis.pipeline()
-        pipe.multi()
-        for key in keys:
-            pipe.lrange(self.redis_key(key), 0, -1)
-        return pipe.execute()
-
-    @staticmethod
-    def _get_items(r, k):
-        return r.lrange(k, 0, -1)
-
-    def remove(self, *keys):
-        self._redis.hdel(self._name, *keys)
-        self._redis.delete(*[self.redis_key(key) for key in keys])
-
-    def remove_val(self, key, val):
-        redis_key = self.redis_key(key)
-        self._redis.lrem(redis_key, val)
-        if not self._redis.exists(redis_key):
-            self._redis.hdel(self._name, redis_key)
 
     def insert(self, key, *vals, **kwargs):
-        # Using buffer=True outside of an `insertion_session`
-        # could lead to inconsistencies, because those
-        # insertion will not be processed until the
-        # buffer is cleared
-        buffer = kwargs.pop('buffer', False)
-        if buffer:
-            self._insert(self._buffer, key, *vals)
-        else:
-            self._insert(self._redis, key, *vals)
-
-    def _insert(self, r, key, *values):
-        redis_key = self.redis_key(key)
-        r.hset(self._name, key, redis_key)
-        r.rpush(redis_key, *values)
-
-    def size(self):
-        return self._redis.hlen(self._name)
-
-    def itemcounts(self):
-        pipe = self._redis.pipeline()
-        pipe.multi()
-        ks = self.keys()
-        for k in ks:
-            self._get_len(pipe, self.redis_key(k))
-        d = dict(zip(ks, pipe.execute()))
-        return d
-
-    @staticmethod
-    def _get_len(r, k):
-        return r.llen(k)
-
-    def has_key(self, key):
-        return self._redis.hexists(self._name, key)
-
-    def empty_buffer(self):
-        self._buffer.execute()
-        # To avoid broken pipes, recreate the connection
-        # objects upon emptying the buffer
-        self.__init__(self.config, name=self._name)
+        element = self._dict.get(key)
+        if element is not None:
+            if not isinstance(element, (tuple, list)):
+                element = {element}
+            vals = set(vals).difference(element)
+        super().insert(key, *vals)
 
 
-class RedisSetStorage(UnorderedStorage, RedisListStorage):
+if redis is not None:
+    class RedisBuffer(redis.client.Pipeline):
+        '''A bufferized version of `redis.pipeline.Pipeline`.
 
-    def __init__(self, config, name=None):
-        RedisListStorage.__init__(self, config, name=name)
+        The only difference from the conventional pipeline object is the
+        ``buffer_size``. Once the buffer is longer than the buffer size,
+        the pipeline is automatically executed, and the buffer cleared.
+        '''
 
-    @staticmethod
-    def _get_items(r, k):
-        return r.smembers(k)
+        def __init__(self, connection_pool, response_callbacks, transaction,
+                     shard_hint=None, buffer_size=50000):
+            self.buffer_size = buffer_size
+            super(RedisBuffer, self).__init__(
+                connection_pool, response_callbacks, transaction,
+                shard_hint=shard_hint)
 
-    def remove_val(self, key, val):
-        redis_key = self.redis_key(key)
-        self._redis.srem(redis_key, val)
-        if not self._redis.exists(redis_key):
-            self._redis.hdel(self._name, redis_key)
+        def execute_command(self, *args, **kwargs):
+            if len(self.command_stack) >= self.buffer_size:
+                self.execute()
+            super(RedisBuffer, self).execute_command(*args, **kwargs)
 
-    def _insert(self, r, key, *values):
-        redis_key = self.redis_key(key)
-        r.hset(self._name, key, redis_key)
-        r.sadd(redis_key, *values)
 
-    @staticmethod
-    def _get_len(r, k):
-        return r.scard(k)
+    class RedisStorage:
+        '''Base class for Redis-based storage containers.
+
+        Args:
+            config (dict): Redis storage units require a configuration
+                of the form::
+
+                    storage_config={
+                        'type': 'redis',
+                        'redis': {'host': 'localhost', 'port': 6379}
+                    }
+
+                one can refer to system environment variables via::
+
+                    storage_config={
+                        'type': 'redis',
+                        'redis': {
+                            'host': {'env': 'REDIS_HOSTNAME',
+                                     'default':'localhost'},
+                            'port': 6379}
+                        }
+                    }
+
+            name (bytes, optional): A prefix to namespace all keys in
+                the database pertaining to this storage container.
+                If None, a random name will be chosen.
+        '''
+
+        def __init__(self, config, name=None):
+            self.config = config
+            redis_param = self._parse_config(self.config['redis'])
+            self._redis = redis.Redis(**redis_param)
+            self._buffer = RedisBuffer(self._redis.connection_pool,
+                                       self._redis.response_callbacks,
+                                       transaction=True)
+            if name is None:
+                name = _random_name(11)
+            self._name = name
+
+        def redis_key(self, key):
+            return self._name + key
+
+        def _parse_config(self, config):
+            cfg = {}
+            for key, value in config.items():
+                # If the value is a plain str, we will use the value
+                # If the value is a dict, we will extract the name of an environment
+                # variable stored under 'env' and optionally a default, stored under
+                # 'default'.
+                # (This is useful if the database relocates to a different host
+                # during the lifetime of the LSH object)
+                if isinstance(value, dict):
+                    if 'env' in value:
+                        value = os.getenv(value['env'], value.get('default', None))
+                cfg[key] = value
+            return cfg
+
+        def __getstate__(self):
+            state = self.__dict__.copy()
+            # We cannot pickle the connection objects, they get recreated
+            # upon unpickling
+            state.pop('_redis')
+            state.pop('_buffer')
+            return state
+
+        def __setstate__(self, state):
+            self.__dict__ = state
+            # Reconnect here
+            self.__init__(self.config, name=self._name)
+
+
+    class RedisListStorage(OrderedStorage, RedisStorage):
+
+        def __init__(self, config, name=None):
+            RedisStorage.__init__(self, config, name=name)
+
+        def keys(self):
+            return self._redis.hkeys(self._name)
+
+        def redis_keys(self):
+            return self._redis.hvals(self._name)
+
+        def status(self):
+            status = self._parse_config(self.config['redis'])
+            status.update(Storage.status(self))
+            return status
+
+        def get(self, key):
+            return self._get_items(self._redis, self.redis_key(key))
+
+        def getmany(self, *keys):
+            pipe = self._redis.pipeline()
+            pipe.multi()
+            for key in keys:
+                pipe.lrange(self.redis_key(key), 0, -1)
+            return pipe.execute()
+
+        @staticmethod
+        def _get_items(r, k):
+            return r.lrange(k, 0, -1)
+
+        def remove(self, *keys):
+            self._redis.hdel(self._name, *keys)
+            self._redis.delete(*[self.redis_key(key) for key in keys])
+
+        def remove_val(self, key, val):
+            redis_key = self.redis_key(key)
+            self._redis.lrem(redis_key, val)
+            if not self._redis.exists(redis_key):
+                self._redis.hdel(self._name, redis_key)
+
+        def insert(self, key, *vals, **kwargs):
+            # Using buffer=True outside of an `insertion_session`
+            # could lead to inconsistencies, because those
+            # insertion will not be processed until the
+            # buffer is cleared
+            buffer = kwargs.pop('buffer', False)
+            if buffer:
+                self._insert(self._buffer, key, *vals)
+            else:
+                self._insert(self._redis, key, *vals)
+
+        def _insert(self, r, key, *values):
+            redis_key = self.redis_key(key)
+            r.hset(self._name, key, redis_key)
+            r.rpush(redis_key, *values)
+
+        def size(self):
+            return self._redis.hlen(self._name)
+
+        def itemcounts(self):
+            pipe = self._redis.pipeline()
+            pipe.multi()
+            ks = self.keys()
+            for k in ks:
+                self._get_len(pipe, self.redis_key(k))
+            d = dict(zip(ks, pipe.execute()))
+            return d
+
+        @staticmethod
+        def _get_len(r, k):
+            return r.llen(k)
+
+        def has_key(self, key):
+            return self._redis.hexists(self._name, key)
+
+        def empty_buffer(self):
+            self._buffer.execute()
+            # To avoid broken pipes, recreate the connection
+            # objects upon emptying the buffer
+            self.__init__(self.config, name=self._name)
+
+
+    class RedisSetStorage(UnorderedStorage, RedisListStorage):
+
+        def __init__(self, config, name=None):
+            RedisListStorage.__init__(self, config, name=name)
+
+        @staticmethod
+        def _get_items(r, k):
+            return r.smembers(k)
+
+        def remove_val(self, key, val):
+            redis_key = self.redis_key(key)
+            self._redis.srem(redis_key, val)
+            if not self._redis.exists(redis_key):
+                self._redis.hdel(self._name, redis_key)
+
+        def _insert(self, r, key, *values):
+            redis_key = self.redis_key(key)
+            r.hset(self._name, key, redis_key)
+            r.sadd(redis_key, *values)
+
+        @staticmethod
+        def _get_len(r, k):
+            return r.scard(k)
 
 
 def _random_name(length):

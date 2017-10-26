@@ -1,6 +1,16 @@
+import ctypes
 import pickle
 from datasketch.storage import (
     ordered_storage, unordered_storage, _random_name)
+
+PyBUF_READ = 0x100
+PyBUF_WRITE = 0x200
+
+PyMemoryView_FromMemory = ctypes.pythonapi.PyMemoryView_FromMemory
+PyMemoryView_FromMemory.restype = ctypes.py_object
+
+PyMemoryView_FromMemory.argtypes = (
+    ctypes.c_char_p, ctypes.c_ssize_t, ctypes.c_int)
 
 _integration_precision = 0.001
 def _integration(f, a, b):
@@ -149,7 +159,7 @@ class MinHashLSH(object):
               for start, end in self.hashranges]
         if self.prepickle:
             key = pickle.dumps(key)
-        self.keys.insert(key, *Hs, buffer=buffer)
+        self.keys.insert(key, minhash.hashvalues, buffer=buffer)
         for H, hashtable in zip(Hs, self.hashtables):
             hashtable.insert(H, key, buffer=buffer)
 
@@ -202,10 +212,12 @@ class MinHashLSH(object):
             key = pickle.dumps(key)
         if key not in self.keys:
             raise ValueError("The given key does not exist")
-        for H, hashtable in zip(self.keys[key], self.hashtables):
-            hashtable.remove_val(H, key)
-            if not hashtable.get(H):
-                hashtable.remove(H)
+        H = self.keys[key]
+        for (start, end), hashtable in zip(self.hashranges, self.hashtables):
+            h = self._H(H[start:end])
+            hashtable.remove_val(h, key)
+            if not hashtable.get(h):
+                hashtable.remove(h)
         self.keys.remove(key)
 
     def is_empty(self):
@@ -217,7 +229,8 @@ class MinHashLSH(object):
 
     @staticmethod
     def _H(hs):
-        return bytes(hs.byteswap().data)
+        ptr = hs.__array_interface__['data'][0]
+        return PyMemoryView_FromMemory(ctypes.c_char_p(ptr), hs.nbytes, PyBUF_READ)
 
     def _query_b(self, minhash, b):
         if len(minhash) != self.h:
@@ -262,8 +275,9 @@ class MinHashLSH(object):
                       range(self.b)]
         Hss = self.keys.getmany(*key_set)
         for key, Hs in zip(key_set, Hss):
-            for H, hashtable in zip(Hs, hashtables):
-                hashtable.insert(H, key)
+            for (start, end), hashtable in zip(self.hashranges, hashtables):
+                h = self._H(Hs[start:end])
+                hashtable.insert(h, key)
         return [hashtable.itemcounts() for hashtable in hashtables]
 
 
